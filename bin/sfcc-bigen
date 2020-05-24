@@ -1,0 +1,125 @@
+#!/usr/bin/python
+
+import argparse
+import json
+import struct
+
+def read_kernel(file_prefix, bitstream_extension):
+    bitstream = open(file_prefix + '.' + bitstream_extension, mode='rb').read()
+    try:
+        frequency = int(open(file_prefix + '.frequency', mode='r').read())
+    except:
+        frequency = 0
+    return (bitstream, frequency)
+
+def create_dummy_metadata(name):
+    metadata = {}
+    metadata['name'] = name
+    metadata['num_args'] = 0
+    metadata['attributes'] = ''
+    metadata['work_group_size'] = 0
+    metadata['compile_work_group_size_0'] = 0
+    metadata['compile_work_group_size_1'] = 0
+    metadata['compile_work_group_size_2'] = 0
+    metadata['local_mem_size'] = 0
+    metadata['preferred_work_group_size_multiple'] = 0
+    metadata['private_mem_size'] = 0
+    metadata['args'] = []
+    return metadata
+
+def generate_kernel_header(metadata):
+    header_size = 1024 + 256 * metadata['num_args']
+    common_header = struct.pack('LIILLLLLLLI180s256s512s', header_size,
+                                metadata['frequency'], metadata['num_args'],
+                                metadata['work_group_size'],
+                                metadata['compile_work_group_size_0'],
+                                metadata['compile_work_group_size_1'],
+                                metadata['compile_work_group_size_2'],
+                                metadata['local_mem_size'],
+                                metadata['preferred_work_group_size_multiple'],
+                                metadata['private_mem_size'],
+                                metadata['snucl_index'],
+                                '', # reserved
+                                metadata['name'].encode('utf-8'),
+                                metadata['attributes'].encode('utf-8'))
+    arg_headers = []
+    for arg in metadata['args']:
+        arg_header = struct.pack('64sII176sL',
+                                 arg['name'].encode('utf-8'),
+                                 arg['address_qualifier'],
+                                 arg['access_qualifier'],
+                                 arg['type_name'].encode('utf-8'),
+                                 arg['type_qualifier'])
+        arg_headers.append(arg_header)
+    return common_header + ''.join(arg_headers)
+
+def generate_kernel_binary(bitstream, metadata):
+    binary = generate_kernel_header(metadata) + \
+             struct.pack('L', len(bitstream)) + bitstream
+    if len(binary) % 8 != 0:
+        binary += '\0' * (8 - (len(binary) % 8))
+    return binary
+
+def generate_kernel_offsets(binaries, base_offset):
+    offsets = []
+    position = base_offset
+    for b in binaries:
+        offsets.append(position)
+        position += len(b)
+    return offsets
+
+def generate_program_binary(kernel_binaries):
+    kernel_offsets = generate_kernel_offsets(kernel_binaries,
+                                             8 + 8 * len(kernel_binaries))
+    return struct.pack('L', len(kernel_binaries)) + \
+           ''.join([struct.pack('L', offset) for offset in kernel_offsets]) + \
+           ''.join(kernel_binaries)
+
+def RShash(s):
+    a = 63689
+    b = 378551
+    h = 0
+    for c in s:
+        h = (h * a + ord(c)) & 0xffffffff
+        a = (a * b) & 0xffffffff
+    return h & 0x7fffffff
+
+def generate_snucl_binary(program_binary):
+    return 'BinE' + struct.pack('I', RShash(program_binary)) + \
+           struct.pack('L', len(program_binary)) + program_binary
+
+def main():
+    parser = argparse.ArgumentParser(description='Generate a SnuCL-F binary.')
+    parser.add_argument('input', help='input directory name')
+    parser.add_argument('--output-file', '-o', default='a.sfb', help='output file'),
+    parser.add_argument('--bitstream-extension', '-b', default='bin',
+                        help='extension of bitstream files')
+    args = parser.parse_args()
+
+    metadata = json.load(open(args.input + '/__meta__.json', mode='r'))
+    print 'Found %i kernels from __meta__.json:' % len(metadata)
+    print [entry['name'] for entry in metadata]
+    metadata.append(create_dummy_metadata('__all__'))
+
+    kernel_binaries = []
+    snucl_index = 0
+    for entry in metadata:
+        try:
+            bitstream, frequency = read_kernel(args.input + '/' + entry['name'],
+                                               args.bitstream_extension)
+            entry['frequency'] = frequency
+            entry['snucl_index'] = snucl_index
+            snucl_index = snucl_index + 1
+            kernel_binary = generate_kernel_binary(bitstream, entry)
+            kernel_binaries.append(kernel_binary)
+        except:
+            print 'Warning: a bitstream for %s is not found...' % entry['name']
+
+    program_binary = generate_program_binary(kernel_binaries)
+    snucl_binary = generate_snucl_binary(program_binary)
+
+    with open(args.output_file, mode='wb') as f:
+        f.write(snucl_binary)
+
+if __name__ == '__main__':
+    main()

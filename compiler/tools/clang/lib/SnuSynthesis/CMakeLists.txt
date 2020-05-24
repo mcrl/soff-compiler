@@ -1,0 +1,29 @@
+add_clang_library(clangSnuSynthesis
+  CGBasicBlock.cpp
+  CGCommon.cpp
+  CGControlFlowUnit.cpp
+  CGMemorySubsystem.cpp
+  CGLockSubsystem.cpp
+  CodeGenerator.cpp
+  ControlFlowConstraint.cpp
+  DataflowGraph.cpp
+  DataflowGraphPrinter.cpp
+  PlatformContext.cpp
+  Scheduler.cpp
+  StructuralAnalysis.cpp
+  Verilog.cpp
+  VerilogPrinter.cpp
+  VirtualVariables.cpp
+  )
+
+add_dependencies(clangSnuSynthesis
+  ClangStmtNodes
+  )
+
+target_link_libraries(clangSnuSynthesis
+  clangAST
+  clangAnalysis
+  clangBasic
+  clangSnuAST
+  clangSnuAnalysis
+  )

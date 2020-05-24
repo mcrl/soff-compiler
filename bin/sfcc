@@ -1,0 +1,253 @@
+#!/usr/bin/python
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import logging
+
+def print_debug(msg):
+  logging.debug(msg)
+
+def print_info(msg):
+  logging.info(msg)
+
+def print_warning(msg):
+  logging.warning(msg)
+
+def check_error(err, msg):
+  if err:
+    logging.error(msg)
+    sys.exit(1)
+
+def call_subprocess(args, fout=None):
+  args = ['stdbuf', '-oL', '-eL'] + args
+  print_debug('Command: {}'.format(' '.join(args)))
+  return subprocess.call(args, stdout=fout, stderr=subprocess.STDOUT)
+
+def make_dir(path):
+  call_subprocess(['mkdir', '-p', path])
+
+def check_path(path):
+  check_error(not os.path.exists(path), '{} does not exist.'.format(path))
+
+def run(args):
+  # SOFF directory structure:
+  # $SOFF_PREFIX
+  # |-bin
+  # | \-soff-compiler,sfcc,sfcc-driver,sfcc-bigen
+  # \-include
+  #   \-soff
+  #     \-opencl_spir.h
+
+  # Workspace directory structure:
+  # Current working directory
+  # |-kernel.cl
+  # \-kernel.cl_workspace_TAG
+
+  # Check $SOFF_PREFIX
+  soff_prefix = os.environ.get('SOFF_PREFIX')
+  check_error(not soff_prefix, 'Set $SOFF_PREFIX.')
+
+  # Check binaries
+  compiler_path = os.path.join(soff_prefix, 'bin/soff-compiler')
+  check_path(compiler_path)
+  driver_path = os.path.join(soff_prefix, 'bin/sfcc-driver')
+  check_path(driver_path)
+  bigen_path = os.path.join(soff_prefix, 'bin/sfcc-bigen')
+  check_path(bigen_path)
+
+  # Check kernel
+  kernel_path = os.path.abspath(args.kernel)
+  check_path(kernel_path)
+  kernel_dir, kernel_base = os.path.split(kernel_path)
+
+  # Check current working directory
+  cwd_path = os.getcwd()
+
+  # Create workspace directory
+  workspace_base = '{}_workspace'.format(kernel_base)
+  if args.tag:
+    workspace_base += '_{}'.format(args.tag)
+  workspace_path = os.path.join(cwd_path, workspace_base)
+  make_dir(workspace_path)
+
+  # Print contexts
+  print_debug('soff_prefix={}'.format(soff_prefix))
+  print_debug('compiler_path={}'.format(compiler_path))
+  print_debug('kernel_dir={}'.format(kernel_dir))
+  print_debug('kernel_base={}'.format(kernel_base))
+  print_debug('cwd_path={}'.format(cwd_path))
+  print_debug('workspace_path={}'.format(workspace_path))
+
+  def compile(target_dir, num_datapath_instances):
+    compile_log_path = os.path.join(target_dir, 'compile.log')
+    with open(compile_log_path, 'w') as fout:
+      compile_args = [compiler_path, '-snucc', '-num-datapath-instances', str(num_datapath_instances), '-prefix', target_dir, '-vcfg', '--target', os.path.join(soff_prefix, 'etc/target.conf')] + args.Xsoff + ['--', '-triple', 'spir64-unknown-unknown', '-include', os.path.join(soff_prefix, 'include/soff/opencl_spir.h')] + args.Xcompiler + [kernel_path]
+      ret = call_subprocess(compile_args, fout)
+      check_error(ret != 0, 'Compile error. Check compile log. ({})'.format(compile_log_path))
+
+  # compile once to get metadata
+  print_info('Test compile starts.')
+  compile(workspace_path, 1)
+  print_info('Test compile was successful.')
+
+  # parse metadata
+  with open(os.path.join(workspace_path, "__meta__.json")) as f:
+    funcs = json.loads(f.read())
+  print_info('{} functions are detected: {}.'.format(len(funcs), ' '.join([func['name'] for func in funcs])))
+  # add virtual function __all__ at front
+  funcs = [{"name" : "__all__"}] + funcs
+
+  def get_driver_workspace_path(func_name, num_datapath_instances, seed):
+    return os.path.join(workspace_path, "{}_n{}_s{}".format(func_name, num_datapath_instances, seed))
+
+  def synthesize(func_name, ndi):
+    success = False
+    for seed in args.seeds:
+      driver_workspace_path = get_driver_workspace_path(func_name, ndi, seed)
+      make_dir(driver_workspace_path)
+      compile(driver_workspace_path, ndi)
+      driver_log_path = os.path.join(driver_workspace_path, 'driver.log')
+      print_info('Call to driver was made. (func={}, n={}, seed={})'.format(func_name, ndi, seed))
+      print_info('Can take up to several hours. Please be patient.')
+      print_info('You can check progress on log. ({})'.format(driver_log_path))
+      with open(driver_log_path, 'w') as fout:
+        ret = call_subprocess(
+          [driver_path,
+          '--workspace', driver_workspace_path,
+          '--input', os.path.join(driver_workspace_path, '{}.v'.format(func_name)),
+          '--output', os.path.join(workspace_path, '{}.bin'.format(func_name)),
+          '--seed', seed], fout)
+      if ret == 0:
+        print_info('Call to driver was successful.')
+        success = True
+        break
+      else:
+        print_info('Call to driver failed.')
+    return success
+
+  # Synthesis
+  all_success = False
+  for func in funcs:
+    func_name = func["name"]
+    if func_name == "__all__" and args.exclude_all:
+      print_info('Option "exclude_all" is on, so synthesis for {} will be skipped.'.format(func_name))
+      continue
+    # if __all__ is successfully synthesized and include_funcs option is off, do not synthesize
+    if all_success and not args.include_funcs:
+      print_info('Option "include_funcs" is off, so synthesis for {} will be skipped.'.format(func_name))
+      call_subprocess(['touch', os.path.join(workspace_path, '{}.bin'.format(func_name))])
+      continue
+    print_info('Synthesis for function "{}" starts.'.format(func_name))
+    success = False
+    if args.search:
+      if args.search_algo == "linear":
+        print_info('Linear search starts.')
+        lb = args.lower_bound
+        ub = args.upper_bound
+        while lb + 1 != ub:
+          ndi = lb + 1
+          print_info('Synthesis for {} datapaths starts.'.format(ndi))
+          print_debug('Linear search: lb={}, ub={}, ndi={}'.format(lb, ub, ndi))
+          ret = synthesize(func_name, ndi)
+          if ret:
+            print_info('Synthesis for {} datapaths was successful.'.format(ndi))
+            lb = ndi
+            success = True
+          else:
+            print_info('Synthesis for {} datapaths failed.'.format(ndi))
+            ub = ndi
+      elif args.search_algo == "binary":
+        print_info('Binary search starts.')
+        lb = args.lower_bound
+        ub = args.upper_bound
+        while lb + 1 != ub:
+          if lb == 0:
+            ndi = 1
+          elif ub == 0:
+            ndi = lb * 2
+          else:
+            ndi = (lb + ub) // 2
+          print_info('Synthesis for {} datapaths starts.'.format(ndi))
+          print_debug('Binary search: lb={}, ub={}, ndi={}'.format(lb, ub, ndi))
+          ret = synthesize(func_name, ndi)
+          if ret:
+            print_info('Synthesis for {} datapaths was successful.'.format(ndi))
+            lb = ndi
+            success = True
+          else:
+            print_info('Synthesis for {} datapaths failed.'.format(ndi))
+            ub = ndi
+    else:
+      print_info('Search is disabled.')
+      ndi = args.num_datapath_instances
+      print_info('Synthesis for {} datapaths starts.'.format(ndi))
+      print_debug('No search: ndi={}'.format(ndi))
+      ret = synthesize(func_name, ndi)
+      if ret:
+        print_info('Synthesis for {} datapaths was successful.'.format(ndi))
+        success = True
+      else:
+        print_info('Synthesis for {} datapaths failed.'.format(ndi))
+    if success:
+      print_info('Synthesis for function "{}" was successful.'.format(func_name))
+    else:
+      print_warning('Synthesis for function "{}" failed. Binary will not contain bitstream for function "{}".'.format(func_name, func_name))
+    if func_name == "__all__" and success:
+      all_success = True
+
+  # bigen
+  output_base = '{}.sfb'.format(kernel_base)
+  if args.tag:
+    output_base += '_{}'.format(args.tag)
+  output_in_workspace_path = os.path.join(workspace_path, output_base)
+  print_info('Running bigen...'.format(func_name))
+  call_subprocess([bigen_path, workspace_path, '-o', output_in_workspace_path])
+
+  output_in_cwd_path = os.path.join(cwd_path, output_base)
+  if args.force or not os.path.exists(output_in_cwd_path):
+    call_subprocess(['cp', output_in_workspace_path, output_in_cwd_path])
+    print_info('Binary generation was successful. ({})'.format(output_in_cwd_path))
+  else:
+    print_warning('Binary already exists. Binary is instead saved in workspace directory. ({})'.format(output_in_workspace_path))
+
+def main():
+  # parse arguments
+  parser = argparse.ArgumentParser()
+  parser.add_argument('--Xcompiler', type=lambda x: x.split(), default=[], help='Options to the compiler. (e.g., --Xcompiler "-DBLOCK_SIZE=16 -I/home/user/include")')
+  parser.add_argument('--Xsoff', type=lambda x: x.split(), default=[], help='Internal options to the compiler.')
+  parser.add_argument('--tag', help='Tag to distinguish between compile runs. Useful when running multiple compilations in parallel. (e.g., workspace will be "kernel.cl_workspace_TAG", binary will be "kernel.cl.sfb_TAG", ...)')
+  parser.add_argument('--exclude-all', action='store_true', help='Do not include bitstream of __all__.')
+  parser.add_argument('--include-funcs', action='store_true', help='Include bitstream of each function, even if bitstream of __all__ is available.')
+  parser.add_argument('--search', action='store_true', help='Option to find the maximum number of datapath instances. If not given, the value passed in --num-datapath-instances will be used.')
+  parser.add_argument('--search-algo', default='binary', help='Search algorithm. Possible values: linear, binary(default).')
+  parser.add_argument('-l', '--lower-bound', type=int, default=0, help='Lowerbound for search. (i.e., the number of datapath instances which was successfully synthesized before)')
+  parser.add_argument('-u', '--upper-bound', type=int, default=0, help='Upperbound for search. (i.e., the number of datapath instances which was failed to be synthesized before)')
+  parser.add_argument("-n", "--num-datapath-instances", type=int, default=1, help="Number of datapath instances. (default 1)")
+  parser.add_argument('--seeds', type=lambda x: x.split(','), default=['0'], help='Comma-seperated synthesis seeds. (e.g., --seeds 1,2,4,8) (default 0)')
+  parser.add_argument('-f', '--force', action='store_true', help='Overwrite final binary even if it exists.')
+  parser.add_argument('--log-level', default='info', help='Possible values: debug, info(default), warning, error.')
+  parser.add_argument('kernel', help='Kernel file name. (e.g., kernel.cl)')
+  args = parser.parse_args()
+
+  if args.log_level == 'debug':
+    logging_level = logging.DEBUG
+  elif args.log_level == 'warning':
+    logging_level = logging.WARNING
+  elif args.log_level == 'error':
+    logging_level = logging.ERROR
+  else:
+    logging_level = logging.INFO
+
+  logging.basicConfig(format='[%(asctime)s %(levelname)s] %(message)s', datefmt='%Y.%m.%d %H:%M:%S', level=logging_level)
+
+  print_debug('Command line arguments: {}'.format(args))
+
+  check_error(not args.search_algo in ['linear', 'binary'], 'Unrecognized search algorithm. ({})'.format(args.search_algo))
+
+  run(args)
+
+if __name__ == '__main__':
+  main()

@@ -1,0 +1,14 @@
+{
+  "name": "__all__",
+  "num_args": 0,
+  "attributes": "",
+  "work_group_size": 0,
+  "compile_work_group_size_0": 0,
+  "compile_work_group_size_1": 0,
+  "compile_work_group_size_2": 0,
+  "local_mem_size": 0,
+  "preferred_work_group_size_multiple": 0,
+  "private_mem_size": 0,
+  "args": [],
+  "snucl_index": 0
+}
